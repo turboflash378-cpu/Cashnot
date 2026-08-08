@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+import os
+import sqlite3
+import random
+import string
+import logging
+import signal
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from typing import Optional
+
+from dotenv import load_dotenv
+import telebot
+from telebot.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
+)
+
+# Load .env if present
+load_dotenv()
+
+# Configuration
+TOKEN = os.getenv("TOKEN")
+DB_PATH = os.getenv("DATABASE", "users.db")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+if not TOKEN:
+    raise SystemExit("ERROR: TOKEN is not set in environment variables")
+
+# Logging
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("cashnot-bot")
+
+# Bot
+bot = telebot.TeleBot(TOKEN, threaded=True)
+
+# Graceful shutdown flag
+running = True
+
+def handle_sigterm(signum, frame):
+    global running
+    logger.info("Received shutdown signal, stopping bot...")
+    running = False
+    try:
+        bot.stop_polling()
+    except Exception:
+        pass
+
+signal.signal(signal.SIGINT, handle_sigterm)
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+# Database helpers
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_db():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                age_group TEXT,
+                ref_code TEXT UNIQUE,
+                referrer_id INTEGER,
+                registered_at TEXT
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_referrer ON users(referrer_id)')
+        conn.commit()
+    logger.info("Database initialized (%s)", DB_PATH)
+
+def generate_ref_code(k=6):
+    alphabet = string.ascii_uppercase + string.digits
+    return ''.join(random.choices(alphabet, k=k))
+
+def add_user(user_id: int, username: str, first_name: str, age_group: str = "не указан", referrer_id: Optional[int] = None):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
+        if cur.fetchone():
+            return False  # already exists
+        # unique ref_code
+        for _ in range(10):
+            ref_code = generate_ref_code()
+            cur.execute('SELECT 1 FROM users WHERE ref_code = ?', (ref_code,))
+            if not cur.fetchone():
+                break
+        else:
+            # fallback: use timestamp
+            ref_code = f"R{int(time.time())}"
+        cur.execute('''
+            INSERT INTO users (user_id, username, first_name, age_group, ref_code, referrer_id, registered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, first_name, age_group, ref_code, referrer_id, datetime.utcnow().isoformat()))
+        conn.commit()
+    logger.info("New user added: %s (referrer=%s)", user_id, referrer_id)
+    return True
+
+def user_exists(user_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
+        return cur.fetchone() is not None
+
+def get_user_by_ref(ref_code: str) -> Optional[int]:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT user_id FROM users WHERE ref_code = ?', (ref_code,))
+        r = cur.fetchone()
+        return r[0] if r else None
+
+def get_user_ref_code(user_id: int) -> Optional[str]:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT ref_code FROM users WHERE user_id = ?', (user_id,))
+        r = cur.fetchone()
+        return r[0] if r else None
+
+def get_user_referrals(user_id: int) -> int:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM users WHERE referrer_id = ?', (user_id,))
+        return cur.fetchone()[0]
+
+def set_age_group(user_id: int, age_group: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('UPDATE users SET age_group = ? WHERE user_id = ?', (age_group, user_id))
+        conn.commit()
+
+# UI: keyboards
+def bottom_menu():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    buttons = [
+        "💡 Идеи", "💰 Цены", "👤 По возрасту", "📊 Заработать",
+        "🌐 Сайты", "📨 Вакансии", "❤️ Поддержать автора", "🤝 Партнёрка"
+    ]
+    markup.add(*[KeyboardButton(b) for b in buttons])
+    return markup
+
+def age_buttons():
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("🔞 До 14 лет", callback_data="age_under14"),
+        InlineKeyboardButton("✅ 14-17 лет", callback_data="age_teen")
+    )
+    markup.row(
+        InlineKeyboardButton("🔹 18+", callback_data="age_adult")
+    )
+    return markup
+
+def donate_buttons():
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("💰 50 ₽", callback_data="donate_50"),
+        InlineKeyboardButton("💰 100 ₽", callback_data="donate_100"),
+        InlineKeyboardButton("💰 200 ₽", callback_data="donate_200")
+    )
+    markup.row(
+        InlineKeyboardButton("💰 500 ₽", callback_data="donate_500"),
+        InlineKeyboardButton("💰 1000 ₽", callback_data="donate_1000")
+    )
+    markup.row(
+        InlineKeyboardButton("💳 Другая сумма", callback_data="donate_other")
+    )
+    return markup
+
+def site_buttons():
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("🌐 Kwork", url="https://kwork.ru"),
+        InlineKeyboardButton("🌐 Fl.ru", url="https://fl.ru")
+    )
+    markup.row(
+        InlineKeyboardButton("🌐 Weblancer", url="https://weblancer.net"),
+        InlineKeyboardButton("🌐 Freelance.ru", url="https://freelance.ru")
+    )
+    markup.row(
+        InlineKeyboardButton("🌐 Habr Freelance", url="https://freelance.habr.com"),
+        InlineKeyboardButton("🌐 Etxt (копирайтинг)", url="https://etxt.ru")
+    )
+    markup.row(
+        InlineKeyboardButton("🌐 TextSale", url="https://textsale.ru"),
+        InlineKeyboardButton("🌐 Turbotext", url="https://turbotext.ru")
+    )
+    markup.row(
+        InlineKeyboardButton("🌐 Upwork (англ.)", url="https://upwork.com")
+    )
+    return markup
+
+# Message tracking to attempt deleting previous bot messages per user (simple)
+user_last_message = {}
+
+def safe_delete(chat_id: int, message_id: Optional[int]):
+    if not message_id:
+        return
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception as e:
+        logger.debug("Could not delete message %s in chat %s: %s", message_id, chat_id, e)
+
+# Handlers
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    first_name = message.from_user.first_name or "Пользователь"
+
+    # parse referral code if provided: /start REF
+    parts = message.text.split(maxsplit=1)
+    ref_code = parts[1].strip() if len(parts) > 1 else None
+    referrer_id = None
+
+    # If user is new, register
+    if not user_exists(user_id):
+        if ref_code:
+            referrer_id = get_user_by_ref(ref_code)
+            if referrer_id and referrer_id == user_id:
+                # ignore self-referral
+                referrer_id = None
+            else:
+                logger.info("User %s used ref %s -> referrer %s", user_id, ref_code, referrer_id)
+
+        added = add_user(user_id, username, first_name, "не указан", referrer_id)
+        if added:
+            # notify referrer (best-effort)
+            if referrer_id:
+                try:
+                    bot.send_message(referrer_id, f"🎉 У тебя новый реферал: {first_name} (https://t.me/{message.from_user.username or 'user'})")
+                except Exception as e:
+                    logger.debug("Failed notifying referrer %s: %s", referrer_id, e)
+
+            # initial prompt
+            msg = bot.send_message(
+                chat_id,
+                "👋 Привет! Я КЭШБОТ 2.0\nПомогаю зарабатывать в Телеграме.\n\n👇 Выбери свой возраст:",
+                reply_markup=age_buttons()
+            )
+            user_last_message[user_id] = msg.message_id
+            return
+
+    # returning user
+    msg = bot.send_message(
+        chat_id,
+        f"🔥 С возвращением, {first_name}!\nВыбирай, что тебя интересует 👇",
+        reply_markup=bottom_menu()
+    )
+    user_last_message[user_id] = msg.message_id
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("age_"))
+def callback_age(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    age_group = call.data.replace("age_", "")
+    set_age_group(user_id, age_group)
+    safe_delete(chat_id, call.message.message_id)
+    msg = bot.send_message(chat_id, "✅ Возраст сохранён!\nВыбирай вариант снизу 👇", reply_markup=bottom_menu())
+    user_last_message[user_id] = msg.message_id
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("donate_"))
+def callback_donate(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    amount = call.data.replace("donate_", "")
+    if amount == "other":
+        amount_text = "любую сумму"
+    else:
+        amount_text = f"{amount} ₽"
+    safe_delete(chat_id, call.message.message_id)
+    msg = bot.send_message(
+        chat_id,
+        f"❤️ Спасибо за поддержку!\nСумма: {amount_text}\n\n"
+        f"Способы оплаты:\n• По номеру карты: 2202 2083 8625 1772\n\n"
+        f"Твоя поддержка помогает развивать бота!",
+        reply_markup=bottom_menu()
+    )
+    user_last_message[user_id] = msg.message_id
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(func=lambda m: True, content_types=['text'])
+def handle_text(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
+
+    # Attempt to remove the user's message and previous bot message
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+    safe_delete(chat_id, user_last_message.get(user_id))
+
+    if text == "💡 Идеи":
+        msg = bot.send_message(
+            chat_id,
+            "💡 ТОП-10 идей заработка:\n1) Стикерпакы\n2) Обработка фото\n3) Модератор чатов\n4) Копирайтинг\n5) Создание ботов\n6) Ведение соцсетей\n7) Дизайн\n8) Озвучка\n9) Партнёрки\n10) Продажа навыков",
+            reply_markup=bottom_menu()
+        )
+        user_last_message[user_id] = msg.message_id
+    elif text == "💰 Цены":
+        msg = bot.send_message(
+            chat_id,
+            "💰 Сколько можно заработать:\n🟢 Новичок: 2 000-10 000 ₽\n🟡 Средний: 10 000-30 000 ₽\n🔴 Профи: 30 000+ ₽",
+            reply_markup=bottom_menu()
+        )
+        user_last_message[user_id] = msg.message_id
+    elif text == "👤 По возрасту":
+        msg = bot.send_message(chat_id, "👤 Выбери свой возраст:", reply_markup=age_buttons())
+        user_last_message[user_id] = msg.message_id
+    elif text == "📊 Заработать":
+        msg = bot.send_message(chat_id, "📊 Как зарабатывать: партнёрки, подписки, реклама, донаты.", reply_markup=bottom_menu())
+        user_last_message[user_id] = msg.message_id
+    elif text == "🌐 Сайты":
+        msg = bot.send_message(chat_id, "🌐 Нажми кнопку для перехода на сайт:", reply_markup=site_buttons())
+        user_last_message[user_id] = msg.message_id
+    elif text == "📨 Вакансии":
+        msg = bot.send_message(chat_id, "📨 Вакансий пока нет. Следите за обновлениями.", reply_markup=bottom_menu())
+        user_last_message[user_id] = msg.message_id
+    elif text == "❤️ Поддержать автора":
+        msg = bot.send_message(chat_id, "❤️ Спасибо! Выберите сумму:", reply_markup=donate_buttons())
+        user_last_message[user_id] = msg.message_id
+    elif text == "🤝 Партнёрка":
+        ref_code = get_user_ref_code(user_id)
+        referrals = get_user_referrals(user_id)
+        try:
+            bot_username = bot.get_me().username
+        except Exception:
+            bot_username = "bot"
+        if ref_code:
+            msg = bot.send_message(
+                chat_id,
+                f"🤝 Твоя партнёрская ссылка:\nhttps://t.me/{bot_username}?start={ref_code}\n\nТы привёл: {referrals}",
+                reply_markup=bottom_menu()
+            )
+        else:
+            msg = bot.send_message(chat_id, "⚠️ Твой реферальный код не найден. /start", reply_markup=bottom_menu())
+        user_last_message[user_id] = msg.message_id
+    else:
+        msg = bot.send_message(chat_id, "❓ Не понял. Используй кнопки снизу.", reply_markup=bottom_menu())
+        user_last_message[user_id] = msg.message_id
+
+def run_polling():
+    backoff = 1
+    while running:
+        try:
+            logger.info("Starting polling...")
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            logger.exception("Polling error: %s. Backing off %s seconds.", e, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)  # cap backoff
+        else:
+            break
+
+if __name__ == "__main__":
+    logger.info("Initializing database and starting bot")
+    init_db()
+    try:
+        run_polling()
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received, exiting")
+    logger.info("Bot stopped")
