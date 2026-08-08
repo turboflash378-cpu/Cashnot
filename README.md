@@ -1,2 +1,2 @@
-# Cashnot
+# Cashbot
 Бот для заработка 
